@@ -1,5 +1,5 @@
 # cvmplot
-![PyPI - Format](https://img.shields.io/pypi/format/https%3A%2F%2Fpypi.org%2Fproject%2Fcvmplot%2F)
+![PyPI - Version](https://img.shields.io/pypi/v/cvmplot)
 ![Static Badge](https://img.shields.io/badge/OS-_Windows_%7C_Mac_%7C_Linux-steelblue)
 
 ## Table of content
