@@ -1196,7 +1196,7 @@ class cvmplot():
             set_num_threads(int(threads))
 
         # 4. 计算距离矩阵
-        return _diff_matrix_numba(array)
+        return cvmplot._diff_matrix_numba(array)
 
 
     @staticmethod
@@ -1226,7 +1226,7 @@ class cvmplot():
         # 先强制转数值，非法值变成 NaN
         numeric_df = df.apply(pd.to_numeric, errors="coerce")
         matrix = numeric_df.to_numpy(dtype=np.float64, copy=False)
-        diff_matrix = get_diff_matrix(matrix, threads=threads)
+        diff_matrix = cvmplot.get_diff_matrix(matrix, threads=threads)
 
         return pd.DataFrame(
             diff_matrix,
