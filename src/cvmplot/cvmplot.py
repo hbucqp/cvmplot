@@ -11,7 +11,7 @@ from scipy.cluster.hierarchy import linkage, dendrogram, complete, to_tree
 from scipy.spatial.distance import squareform
 from tabulate import tabulate
 from io import StringIO
-
+from numba import njit, prange, set_num_threads
 
 # genbank file read/parse/plot
 from Bio import SeqIO
@@ -30,8 +30,6 @@ import matplotlib.collections as mpcollections
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from typing import Optional, List, Dict, Union, Tuple
 
-# data process
-import dask.array as da
 
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['Arial']
@@ -1064,73 +1062,182 @@ class cvmplot():
                                  label=key, markersize=markersize) for key in Cate_dict.keys()]
         return legend_element
 
+    # @staticmethod
+    # def get_diff_matrix(array,
+    #                     chunks: Optional[Tuple]=None):
+    #     """
+    #     Function to count the number of differences of values between rows, default ignoring NaN
+    #     Parameters
+    #     ----------
+    #     array: numpy.array
+    #         The array format of the input table
+    #     chunks: (x, y)
+    #         1D tuple-like of floats to specify the chunks size
+
+    #     Returns
+    #     -------
+    #     A matrix store the number of differenct values between rows.
+
+    #     Raises
+    #     ------
+    #     Notes
+    #     -----
+    #     References
+    #     ----------
+    #     See Also
+    #     --------
+    #     Examples
+    #     --------
+    #     """
+    #     darray = da.from_array(array, chunks=(100, 100))
+    #     valid_mask = da.logical_and(
+    #         ~da.isnan(darray[:, None]), ~da.isnan(darray))
+    #     diff_count = da.sum(valid_mask, axis=-1) - \
+    #         da.sum(da.equal(darray[:, None], darray), axis=-1)
+    #     diff_matrix = diff_count.compute()
+    #     return diff_matrix
+
+    # @staticmethod
+    # def get_diff_df(df):
+    #     """
+    #     Function to count the number of differences of values between rows, default ignoring NaN
+    #     The index of input dataframe should be your sample name.
+
+    #     Parameters
+    #     -------------
+    #     df: pandas.dataframe
+    #         The data frame store the MLST/cgMLST or other data
+
+    #     Returns
+    #     -------
+    #     A dataframe store the number of differenct values between rows with sample name as the dataframe columns or index.
+
+    #     Raises
+    #     ------
+    #     Notes
+    #     -----
+    #     References
+    #     ----------
+    #     See Also
+    #     --------
+    #     Examples
+    #     --------
+    #     """
+    #     df = df.astype('float')
+    #     labels = list(df.index)
+    #     matrix = df.values
+    #     diff_matrix = cvmplot.get_diff_matrix(matrix)
+    #     diff_df = pd.DataFrame(diff_matrix, index=labels, columns=labels)
+    #     return diff_df
+    
+
     @staticmethod
-    def get_diff_matrix(array,
-                        chunks: Optional[Tuple]=None):
+    @njit(parallel=True)
+    def _diff_matrix_numba(array):
         """
-        Function to count the number of differences of values between rows, default ignoring NaN
-        Parameters
-        ----------
-        array: numpy.array
-            The array format of the input table
-        chunks: (x, y)
-            1D tuple-like of floats to specify the chunks size
+        计算 cgMLST 两两 allelic distance。
 
-        Returns
-        -------
-        A matrix store the number of differenct values between rows.
+        array:
+            n_samples x n_loci
+            dtype 建议 int32
+            缺失值用 -1 表示
 
-        Raises
-        ------
-        Notes
-        -----
-        References
-        ----------
-        See Also
-        --------
-        Examples
-        --------
+        规则：
+            两个样本同一位点都非缺失，且等位基因不同，则差异 +1
+            任一方缺失，则该位点跳过
         """
-        darray = da.from_array(array, chunks=(100, 100))
-        valid_mask = da.logical_and(
-            ~da.isnan(darray[:, None]), ~da.isnan(darray))
-        diff_count = da.sum(valid_mask, axis=-1) - \
-            da.sum(da.equal(darray[:, None], darray), axis=-1)
-        diff_matrix = diff_count.compute()
+        n, m = array.shape
+        diff_matrix = np.zeros((n, n), dtype=np.uint16)
+
+        for i in prange(n):
+            row_i = array[i]
+            for j in range(i + 1, n):
+                row_j = array[j]
+                d = 0
+                for k in range(m):
+                    a = row_i[k]
+                    b = row_j[k]
+                    if a != -1 and b != -1 and a != b:
+                        d += 1
+                diff_matrix[i, j] = d
+                diff_matrix[j, i] = d
+
         return diff_matrix
 
     @staticmethod
-    def get_diff_df(df):
+    def get_diff_matrix(array, threads=None):
         """
-        Function to count the number of differences of values between rows, default ignoring NaN
-        The index of input dataframe should be your sample name.
+        优化版距离矩阵计算函数。
 
-        Parameters
-        -------------
-        df: pandas.dataframe
-            The data frame store the MLST/cgMLST or other data
+        输入：
+            array: numpy array 或 pandas values
+                可以包含 np.nan
 
-        Returns
-        -------
-        A dataframe store the number of differenct values between rows with sample name as the dataframe columns or index.
+        输出：
+            n x n 的 pairwise diff matrix，dtype=uint16
 
-        Raises
-        ------
-        Notes
-        -----
-        References
-        ----------
-        See Also
-        --------
-        Examples
-        --------
+        注意：
+            如果你的 cgMLST 位点数 > 65535，需要把 uint16 改成 uint32。
+            你现在是 3000 列，uint16 完全够用。
         """
-        df = df.astype('float')
-        labels = list(df.index)
-        matrix = df.values
-        diff_matrix = cvmplot.get_diff_matrix(matrix)
-        diff_df = pd.DataFrame(diff_matrix, index=labels, columns=labels)
-        return diff_df
+
+        # 1. 转成 numpy array
+        array = np.asarray(array)
+
+        # 2. 把 float/NaN 转成 int32/-1
+        #    cgMLST allele 本质是整数，没必要用 float
+        if np.issubdtype(array.dtype, np.floating):
+            array = np.where(np.isnan(array), -1, array).astype(np.int32)
+        else:
+            array = array.astype(np.int32, copy=False)
+
+        # 3. 如果有线程参数，设置 numba 线程数
+        if threads is not None:
+            set_num_threads(int(threads))
+
+        # 4. 计算距离矩阵
+        return _diff_matrix_numba(array)
+
+
+    @staticmethod
+    def df_to_numeric_matrix(df):
+        """
+        convert np.nan to -1 in the input dataframe and return as numpy array
+        """
+        numeric_df = df.apply(pd.to_numeric, errors="coerce")
+        matrix = numeric_df.to_numpy(dtype=np.float64, copy=False)
+        matrix = np.where(np.isnan(matrix), -1, matrix).astype(np.int32)
+        return matrix
+
+
+    @staticmethod
+    def get_diff_df(df, threads=None):
+        """
+        优化版 DataFrame 输入函数。
+
+        输入:
+            df: 行为样本，列为 cgMLST 位点
+
+        输出:
+            DataFrame 格式距离矩阵，行列名均为样本 ID
+        """
+
+        # 比 df.astype('float').values 更稳
+        # 先强制转数值，非法值变成 NaN
+        numeric_df = df.apply(pd.to_numeric, errors="coerce")
+        matrix = numeric_df.to_numpy(dtype=np.float64, copy=False)
+        diff_matrix = get_diff_matrix(matrix, threads=threads)
+
+        return pd.DataFrame(
+            diff_matrix,
+            index=df.index,
+            columns=df.index,
+        )
+    
+
+
+    
+
 
     @staticmethod
     def _skip_ticks(labels, tickevery, startpoint, axis):
